@@ -1,2 +1,1 @@
-# meta2
-misa and tylo die
+nico if youre here go away
