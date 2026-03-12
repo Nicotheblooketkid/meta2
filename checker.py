@@ -2,17 +2,18 @@ import requests
 import itertools
 import os
 import random
-import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_FILE      = "username.txt"
-WORKERS         = 100
-BATCH_SIZE      = 1000
+WORKERS         = 10
 DEBUG           = False
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+MAX_RUNTIME     = 5.5 * 60 * 60
+START_TIME      = time.time()
 
-# ── ANSI colours (GitHub Actions supports them) ───────────────────────────────
+# ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
@@ -38,27 +39,32 @@ AVAILABLE_MESSAGES = [
     f"{GREEN}{BOLD}🚀 ALL YOURS — wide open{RESET}",
 ]
 
-
 # ── Discord ───────────────────────────────────────────────────────────────────
 
 def send_discord_alert(name: str):
-    """Fire a Discord webhook ping for an available username."""
     if not DISCORD_WEBHOOK:
-        print(f"{YELLOW}  ⚠  DISCORD_WEBHOOK not set — skipping notification for '{name}'{RESET}", flush=True)
+        print(f"{YELLOW}  ⚠  DISCORD_WEBHOOK not set — skipping '{name}'{RESET}", flush=True)
         return
     payload = {
         "content": f"@everyone\nAvailable name: **{name}**",
         "allowed_mentions": {"parse": ["everyone"]},
     }
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        if r.status_code not in (200, 204):
-            print(f"{YELLOW}  ⚠  Discord webhook returned {r.status_code} for '{name}'{RESET}", flush=True)
-    except Exception as e:
-        print(f"{YELLOW}  ⚠  Discord webhook error for '{name}': {e}{RESET}", flush=True)
+    for attempt in range(5):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            if r.status_code in (200, 204):
+                return
+            if r.status_code == 429:
+                retry_after = float(r.json().get("retry_after", 1))
+                time.sleep(retry_after)
+                continue
+            print(f"{YELLOW}  ⚠  Webhook returned {r.status_code} for '{name}'{RESET}", flush=True)
+            return
+        except Exception as e:
+            print(f"{YELLOW}  ⚠  Webhook error for '{name}': {e}{RESET}", flush=True)
+            time.sleep(1)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Check Logic ───────────────────────────────────────────────────────────────
 
 def cap_variants(name: str):
     seen = set()
@@ -75,41 +81,36 @@ def cap_variants(name: str):
                 seen.add(v)
                 yield v
 
-
 def single_check(session, variant):
-    """Check one exact variant. Returns 'TAKEN', 'AVAILABLE', or None (inconclusive)."""
     url = f"https://horizon.meta.com/profile/{variant}/"
     try:
         r = session.get(url, allow_redirects=False, timeout=10)
         loc = r.headers.get("Location", "")
-
         if DEBUG:
             print(f"{YELLOW}  DEBUG  {variant:20} -> {r.status_code}  {loc}{RESET}", flush=True)
-
         if r.status_code == 200:
             return "TAKEN"
         if r.status_code in (301, 302):
             if loc == "https://horizon.meta.com/":
-                return "AVAILABLE"   # redirected to homepage = username not found
-            return "TAKEN"           # redirected to a real profile page
+                return "AVAILABLE"
+            return "TAKEN"
     except Exception:
         pass
-    return None  # inconclusive
-
+    return None
 
 def check_username(idx, name, total):
     name = name.strip().lstrip("@")
     if not name:
         return idx, name, "SKIP"
 
+    time.sleep(1.0)  # rate limit protection
+
     session = requests.Session()
 
-    # Step 1: check exactly as typed
     result = single_check(session, name)
     if result == "TAKEN":
         return idx, name, "TAKEN"
     if result == "AVAILABLE":
-        # Exact form is free — verify cap variants too
         for variant in cap_variants(name):
             if variant == name:
                 continue
@@ -118,7 +119,6 @@ def check_username(idx, name, total):
                 return idx, name, "TAKEN"
         return idx, name, "AVAILABLE"
 
-    # Step 2: exact check inconclusive — try cap variants
     for variant in cap_variants(name):
         if variant == name:
             continue
@@ -128,67 +128,66 @@ def check_username(idx, name, total):
 
     return idx, name, "AVAILABLE"
 
+# ── Run one pass through the list ─────────────────────────────────────────────
+
+def run_pass(usernames, cycle, total_found):
+    total = len(usernames)
+    batch = usernames[:]
+    random.shuffle(batch)  # different order every cycle
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {
+            executor.submit(check_username, idx, name, total): name
+            for idx, name in enumerate(batch, 1)
+        }
+        for future in as_completed(futures):
+            idx, name, status = future.result()
+            prefix = f"{DIM}[C{cycle}][{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{name:<20}{RESET}"
+            if status == "TAKEN":
+                print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
+            elif status == "AVAILABLE":
+                print(f"{prefix}  {random.choice(AVAILABLE_MESSAGES)}", flush=True)
+                send_discord_alert(name)
+                total_found += 1
+
+    return total_found
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     print(f"\n{CYAN}{BOLD}{'=' * 50}{RESET}")
     print(f"{PINK}{BOLD}      💻  M E L L O W 'S  U S E R  F I N D E R  💻{RESET}")
-    print(f"{DIM}               made by mellowpluh and leaked by eon,tylosin,and finn{RESET}")
+    print(f"{DIM}        24/7 mode — loops username.txt until 5.5hrs{RESET}")
     print(f"{CYAN}{BOLD}{'=' * 50}{RESET}\n")
 
     if not os.path.exists(INPUT_FILE):
         print(f"{RED}  ✖  '{INPUT_FILE}' not found!{RESET}")
-        sys.exit(1)
+        return
 
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         usernames = [l.strip() for l in f if l.strip()]
 
-    total   = len(usernames)
-    results = {}
-    seen    = set()
-    batches = [usernames[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+    print(f"{DIM}  Loaded {len(usernames)} usernames from {INPUT_FILE}{RESET}\n", flush=True)
 
-    for batch_num, batch in enumerate(batches, 1):
-        if len(batches) > 1:
-            print(f"{CYAN}{DIM}  ── Batch {batch_num}/{len(batches)} ({len(batch)} usernames) ──{RESET}\n")
+    total_found = 0
+    cycle = 1
 
-        offset = (batch_num - 1) * BATCH_SIZE
+    while True:
+        elapsed = time.time() - START_TIME
+        if elapsed > MAX_RUNTIME:
+            print(f"\n{YELLOW}{BOLD}  ⏱  Approaching 6hr limit — stopping cleanly. GitHub Actions will restart.{RESET}\n")
+            break
 
-        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-            futures = {
-                executor.submit(check_username, offset + idx, name, total): (offset + idx, name)
-                for idx, name in enumerate(batch, 1)
-                if name.lower() not in seen and not seen.add(name.lower())
-            }
+        print(f"\n{CYAN}{DIM}  ── Cycle {cycle} | Elapsed: {int(elapsed // 60)}m | Found so far: {total_found} ──{RESET}\n", flush=True)
 
-            for future in as_completed(futures):
-                idx, name, status = future.result()
-                results[idx] = (name, status)
-                prefix = f"{DIM}[{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{name:<20}{RESET}"
-                if status == "TAKEN":
-                    print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
-                elif status == "AVAILABLE":
-                    print(f"{prefix}  {random.choice(AVAILABLE_MESSAGES)}", flush=True)
-                    send_discord_alert(name)
+        total_found = run_pass(usernames, cycle, total_found)
+        cycle += 1
 
-    taken     = []
-    available = []
-    for idx in sorted(results):
-        name, status = results[idx]
-        if status == "TAKEN":
-            taken.append(name)
-        elif status == "AVAILABLE":
-            available.append(name)
-
-    with open("available.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(available))
-    with open("taken.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(taken))
+        print(f"\n{DIM}  Cycle done. Restarting in 5 seconds...{RESET}", flush=True)
+        time.sleep(5)
 
     print(f"\n{CYAN}{BOLD}{'=' * 50}{RESET}")
-    print(f"{RED}{BOLD}  🔒  TAKEN    : {len(taken)}{RESET}")
-    print(f"{GREEN}{BOLD}  💎  AVAILABLE: {len(available)}{RESET}")
+    print(f"{GREEN}{BOLD}  💎  TOTAL AVAILABLE FOUND: {total_found}{RESET}")
     print(f"{CYAN}{BOLD}{'=' * 50}{RESET}\n")
 
 
