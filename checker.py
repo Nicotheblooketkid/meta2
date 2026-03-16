@@ -91,7 +91,7 @@ def single_check(session, variant):
         if r.status_code == 200:
             return "TAKEN"
         if r.status_code in (301, 302):
-            if loc == "https://horizon.meta.com/":
+            if loc.rstrip("/") in ("https://horizon.meta.com", "https://www.meta.com"):
                 return "AVAILABLE"
             return "TAKEN"
     except Exception:
