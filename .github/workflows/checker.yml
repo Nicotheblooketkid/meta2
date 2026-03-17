@@ -23,5 +23,6 @@ jobs:
       - name: Run checker
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          OCULUS_TOKEN: ${{ secrets.OCULUS_TOKEN }}
         run: python checker.py
         timeout-minutes: 350
