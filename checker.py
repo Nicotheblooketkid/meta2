@@ -46,7 +46,7 @@ def send_discord_alert(name: str):
         print(f"{YELLOW}  ⚠  DISCORD_WEBHOOK not set — skipping '{name}'{RESET}", flush=True)
         return
     payload = {
-        "content": f"@everyone\nAvailable name: **{name}**",
+        "content": f"@everyone\n@everyone Available name: **{name}**",
         "allowed_mentions": {"parse": ["everyone"]},
     }
     for attempt in range(5):
@@ -98,6 +98,36 @@ def single_check(session, variant):
         pass
     return None
 
+OCULUS_TOKEN = os.environ.get("OCULUS_TOKEN", "")
+
+def oculus_confirm(name):
+    """Secondary confirm via Oculus API — returns True if available, False if taken"""
+    try:
+        r = requests.get(
+            "https://graph.oculus.com/user_checks_by_alias",
+            params={
+                "alias": name,
+                "locale": "en_US",
+                "access_token": OCULUS_TOKEN,
+            },
+            timeout=10
+        )
+        data = r.json()
+        if DEBUG:
+            print(f"{YELLOW}  OCULUS  {name} -> {data}{RESET}", flush=True)
+        # Taken: error response with code 100
+        if "error" in data:
+            return False
+        # Available: data array with exists=false
+        entries = data.get("data", [])
+        if entries and entries[0].get("exists") == False:
+            return True
+        return False  # anything else = treat as taken
+    except Exception as e:
+        if DEBUG:
+            print(f"{YELLOW}  OCULUS ERROR  {name}: {e}{RESET}", flush=True)
+        return False  # treat as taken on error
+
 def check_username(idx, name, total):
     name = name.strip().lstrip("@")
     if not name:
@@ -107,24 +137,15 @@ def check_username(idx, name, total):
 
     session = requests.Session()
 
-    result = single_check(session, name)
-    if result == "TAKEN":
-        return idx, name, "TAKEN"
-    if result == "AVAILABLE":
-        for variant in cap_variants(name):
-            if variant == name:
-                continue
-            r = single_check(session, variant)
-            if r == "TAKEN":
-                return idx, name, "TAKEN"
-        return idx, name, "AVAILABLE"
-
+    # Step 1: Check ALL cap variants on horizon
     for variant in cap_variants(name):
-        if variant == name:
-            continue
         r = single_check(session, variant)
         if r == "TAKEN":
             return idx, name, "TAKEN"
+
+    # Step 2: Confirm via Oculus API
+    if not oculus_confirm(name):
+        return idx, name, "TAKEN"
 
     return idx, name, "AVAILABLE"
 
